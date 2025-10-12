@@ -62,7 +62,7 @@ class BilibiliPlatformEvent(AstrMessageEvent):
         # 首选：会话 ID
         try:
             return int(sid)
-        except Exception:
+        except (ValueError, TypeError):
             pass
 
         # 回退：消息发送者 ID（仅私信场景合理）
@@ -70,7 +70,7 @@ class BilibiliPlatformEvent(AstrMessageEvent):
             sender_id = getattr(self.message_obj, "sender", None)
             if sender_id and getattr(sender_id, "user_id", None) is not None:
                 return int(sender_id.user_id)
-        except Exception:
+        except (ValueError, TypeError):
             pass
         return None
 
@@ -108,13 +108,11 @@ class BilibiliPlatformEvent(AstrMessageEvent):
                     if item.text:
                         text_buffer.append(item.text)
                 elif isinstance(item, Image):
-                    # 先衝刷已有文本
                     await flush_text_buffer()
 
                     image_bytes: Optional[bytes] = None
                     cache_key: Optional[str] = None
 
-                    # 智能處理圖片來源，優先級: path > url > raw
                     if hasattr(item, "path") and item.path:
                         cache_key = item.path
                         try:
@@ -136,12 +134,12 @@ class BilibiliPlatformEvent(AstrMessageEvent):
                     else:
                         logger.error("無法獲取圖片數據，無法發送圖片。")
                 else:
-                    # 遇到不支持的類型時，先衝刷文本，再忽略該類型
                     await flush_text_buffer()
                     logger.warning(f"忽略不支持的消息組件: {item.__class__.__name__}")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"發送 Bilibili 消息時出錯: {e}", exc_info=True)
 
         # 末尾衝刷可能殘留的文本
         await flush_text_buffer()
-        await super().send(message)

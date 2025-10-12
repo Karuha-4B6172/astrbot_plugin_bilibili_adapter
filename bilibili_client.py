@@ -1,9 +1,9 @@
 import json
 import time
 import asyncio
-import imghdr
 import mimetypes
 from typing import Optional, Tuple
+from collections import OrderedDict
 
 import aiohttp
 from astrbot.api import logger
@@ -85,12 +85,52 @@ class BilibiliClient:
             "bili_jct": self._bili_jct,
         }
         self._session: Optional[aiohttp.ClientSession] = None
-        self._image_cache: dict[str, dict] = {}  # 圖片快取: {cache_key: image_info}
+        # 圖片快取（LRU + TTL）: {key: (image_info, expires_at)}
+        self._image_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
+        self._image_cache_max_size: int = 256
+        self._image_cache_ttl_seconds: int = 1800
+
+    def _cache_get(self, key: Optional[str]) -> Optional[dict]:
+        if not key:
+            return None
+        now = time.time()
+        try:
+            value = self._image_cache.get(key)
+            if not value:
+                return None
+            image_info, expires_at = value
+            if expires_at < now:
+                try:
+                    del self._image_cache[key]
+                except Exception:
+                    pass
+                return None
+            self._image_cache.move_to_end(key)
+            return image_info
+        except Exception:
+            return None
+
+    def _cache_set(self, key: Optional[str], image_info: Optional[dict]):
+        if not key or not image_info:
+            return
+        try:
+            expires_at = time.time() + float(self._image_cache_ttl_seconds)
+            self._image_cache[key] = (image_info, expires_at)
+            self._image_cache.move_to_end(key)
+            while len(self._image_cache) > int(self._image_cache_max_size):
+                try:
+                    self._image_cache.popitem(last=False)
+                except Exception:
+                    break
+        except Exception:
+            pass
 
     async def _safe_json_from_response(self, response: aiohttp.ClientResponse) -> Optional[dict]:
         """安全解析 JSON，非 JSON 或解析失败时返回 None，并打印精简响应片段便于排查。"""
         try:
             text = await response.text()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             try:
                 logger.error(f"讀取響應體失敗: url='{response.url}', 錯誤: {e}")
@@ -99,6 +139,8 @@ class BilibiliClient:
             return None
         try:
             return json.loads(text)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             preview = text[:200] if isinstance(text, str) else str(text)[:200]
             try:
@@ -110,17 +152,24 @@ class BilibiliClient:
             return None
 
     def _guess_filename_and_content_type(self, image_data: bytes, filename: Optional[str]) -> Tuple[str, str]:
-        """盡力推斷圖片文件名與 content-type。推斷失敗則回退到二進制。"""
+        """盡力推斷圖片文件名與 content-type。優先擴展名；否則以常見魔數判斷；最後回退。"""
         ext: Optional[str] = None
         if filename and "." in filename:
             ext = filename.rsplit(".", 1)[1].lower()
 
-        if not ext:
-            kind = imghdr.what(None, h=image_data)
-            if kind == "jpeg":
-                ext = "jpg"
-            elif kind:
-                ext = kind
+        if not ext and image_data:
+            head = image_data[:12]
+            try:
+                if head.startswith(b"\xff\xd8\xff"):
+                    ext = "jpg"
+                elif head.startswith(b"\x89PNG\r\n\x1a\n"):
+                    ext = "png"
+                elif head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+                    ext = "gif"
+                elif head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+                    ext = "webp"
+            except Exception:
+                ext = None
 
         if ext:
             ct = mimetypes.types_map.get(f".{ext}", f"image/{ext}")
@@ -135,16 +184,7 @@ class BilibiliClient:
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
 
-    def __del__(self):
-        """最佳努力在對象銷毀時關閉會話（若事件循環仍在運行）。"""
-        try:
-            if self._session and not self._session.closed:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._session.close())
-        except Exception:
-            # 靜默處理，避免在解構期間引發新的異常
-            pass
+    
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """初始化並返回 aiohttp 客戶端 Session。"""
@@ -198,6 +238,8 @@ class BilibiliClient:
                         f"獲取 Bilibili 用戶信息錯誤: {response.status}, message='{response.reason}', url='{response.url}', body='{body_preview}'"
                     )
                     return False, None
+        except asyncio.CancelledError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"請求 Bilibili 用戶信息時發生網絡錯誤: {e}")
             return False, None
@@ -224,11 +266,13 @@ class BilibiliClient:
                         f"獲取 Bilibili New Session 時發生錯誤: {response.status}, message='{response.reason}', url='{response.url}'"
                     )
                     return None
+        except asyncio.CancelledError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"獲取 Bilibili New Session 時發生網絡錯誤: {e}")
             return None
-        except Exception as e:
-            logger.error(f"獲取 Bilibili New Session 時發生異常: {e}")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"獲取 Bilibili New Session 時發生數據處理錯誤: {e}")
             return None
 
     async def get_messages(
@@ -267,11 +311,13 @@ class BilibiliClient:
                         f"獲取 Bilibili 消息列表時發生錯誤: {response.status}, message='{response.reason}', url='{response.url}'"
                     )
                     return None
+        except asyncio.CancelledError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"獲取 Bilibili 消息列表時發生網絡錯誤: {e}")
             return None
-        except Exception as e:
-            logger.error(f"獲取 Bilibili 消息列表時發生異常: {e}")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"獲取 Bilibili 消息列表時發生數據處理錯誤: {e}")
             return None
 
     async def update_ack(
@@ -306,11 +352,13 @@ class BilibiliClient:
                         f"更新 Bilibili 已讀回執時發生錯誤: {response.status}, message='{response.reason}', url='{response.url}'"
                     )
                     return False
+        except asyncio.CancelledError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"更新 Bilibili 已讀回執時發生網絡錯誤: {e}")
             return False
-        except Exception as e:
-            logger.error(f"更新 Bilibili 已讀回執時發生異常: {e}")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"更新 Bilibili 已讀回執時發生數據處理錯誤: {e}")
             return False
 
     async def download_image_from_url(self, url: str) -> Optional[bytes]:
@@ -328,9 +376,6 @@ class BilibiliClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"從 URL 下載圖片時發生網絡錯誤: {url}, 錯誤: {e}")
             return None
-        except Exception as e:
-            logger.error(f"從 URL 下載圖片時發生異常: {url}, 錯誤: {e}")
-            return None
 
     async def upload_image(
         self,
@@ -339,9 +384,10 @@ class BilibiliClient:
         cache_key: Optional[str] = None,
     ) -> Optional[dict]:
         # 檢查快取
-        if cache_key and cache_key in self._image_cache:
+        cached = self._cache_get(cache_key)
+        if cached is not None:
             logger.debug(f"命中圖片快取: {cache_key}")
-            return self._image_cache[cache_key]
+            return cached
 
         """上載圖片到 Bilibili 伺服器。
 
@@ -373,7 +419,7 @@ class BilibiliClient:
                         logger.info(f"圖片上載成功: {image_info.get('image_url')}")
                         # 存入快取
                         if cache_key and image_info:
-                            self._image_cache[cache_key] = image_info
+                            self._cache_set(cache_key, image_info)
                             logger.debug(f"圖片已快取: {cache_key}")
                         return image_info
                     else:
@@ -392,6 +438,8 @@ class BilibiliClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"上載圖片時發生網絡錯誤: {e}")
             return None
+        except asyncio.CancelledError:
+            raise
 
     async def _send_message(self, payload: dict) -> bool:
         """統一的消息發送方法。"""
@@ -417,9 +465,18 @@ class BilibiliClient:
                         f"向 {receiver_id} 發送消息時發生錯誤: {response.status}, message='{response.reason}', url='{response.url}', body='{body_preview}'"
                     )
                     return False
+        except asyncio.CancelledError:
+            raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(f"向 {receiver_id} 發送消息時發生通信錯誤: {e}")
             return False
+
+    def clear_image_cache(self):
+        """清空圖片快取。"""
+        try:
+            self._image_cache.clear()
+        except Exception:
+            pass
 
     async def send_image_message(self, receiver_id: int, image_info: dict) -> bool:
         """發送圖片私信。"""

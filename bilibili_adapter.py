@@ -1,7 +1,9 @@
 import asyncio
 import json
+import random
 from datetime import datetime
 from typing import Optional
+import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -162,8 +164,6 @@ def _inject_astrbot_field_metadata():
             pass
 
 
-_inject_astrbot_field_metadata()
- 
 def _pre_unregister_platform():
     """在注册适配器前，预清理可能残留的注册（仅本插件来源），避免热重载冲突。"""
     try:
@@ -179,7 +179,8 @@ def _pre_unregister_platform():
         # 静默处理，避免因核心结构差异影响加载
         pass
 
-_pre_unregister_platform()
+ 
+
 
 @register_platform_adapter(
     "bilibili",
@@ -399,13 +400,13 @@ class BilibiliAdapter(Platform):
                     if has_messages:
                         self.consecutive_empty_polls = 0
                         self.current_poll_interval = max(
-                            self.min_poll_interval, self.current_poll_interval * 0.8
+                            self.min_poll_interval, self.current_poll_interval * 0.9
                         )
                     else:
                         self.consecutive_empty_polls += 1
                         if self.consecutive_empty_polls > 3:
                             self.current_poll_interval = min(
-                                self.max_poll_interval, self.current_poll_interval * 1.2
+                                self.max_poll_interval, self.current_poll_interval * 1.1
                             )
 
                 # 安全更新時間戳
@@ -416,21 +417,35 @@ class BilibiliAdapter(Platform):
 
                 retry_count = 0  # 重置重試次數
 
-                await asyncio.sleep(self.current_poll_interval)
-            except Exception as e:
+                # 抖動 ±10% 並夾持在最小/最大輪詢區間
+                j = 0.1 * self.current_poll_interval
+                jittered = self.current_poll_interval + ((random.random() * 2) - 1.0) * j
+                if jittered < self.min_poll_interval:
+                    jittered = self.min_poll_interval
+                if jittered > self.max_poll_interval:
+                    jittered = self.max_poll_interval
+                await asyncio.sleep(jittered)
+            except asyncio.CancelledError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 retry_count += 1
                 logger.error(
-                    f"Bilibili Adapter 運行時發生未預期的錯誤 (重试 {retry_count}/{self.max_retry_count}): {e}",
+                    f"Bilibili Adapter 網絡/超時錯誤 (重試 {retry_count}/{self.max_retry_count}): {e}",
                     exc_info=True,
                 )
 
                 if retry_count >= self.max_retry_count:
-                    logger.critical("達到最大重試次數，适配器将停止运行")
+                    logger.critical("達到最大重試次數，适配器將停止運行")
                     break
 
                 # 指數退避重試
                 backoff_time = min(60, self.poll_interval * (2**retry_count))
                 await asyncio.sleep(backoff_time)
+            except Exception as e:
+                logger.critical(
+                    f"Bilibili Adapter 發生非預期錯誤，將停止運行: {e}", exc_info=True
+                )
+                break
 
         # 运行结束，确保资源释放
         self._running = False
@@ -496,9 +511,20 @@ class BilibiliAdapter(Platform):
                         talker_id, session_type, max_seqno_in_batch
                     )
 
-        except Exception as e:
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error(
-                f"處理 Session {talker_id} 的訊息時發生錯誤: {e}", exc_info=True
+                f"處理 Session {talker_id} 的訊息時發生網絡/超時錯誤: {e}", exc_info=True
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.error(
+                f"處理 Session {talker_id} 的訊息時發生數據處理錯誤: {e}", exc_info=True
+            )
+        except Exception as e:
+            logger.critical(
+                f"處理 Session {talker_id} 的訊息時發生非預期錯誤: {e}",
+                exc_info=True,
             )
 
     def convert_message(self, data: dict, session_talker_id: int) -> Optional[AstrBotMessage]:
@@ -517,7 +543,7 @@ class BilibiliAdapter(Platform):
                 text_content = content_data.get("content", "")
                 if not text_content:
                     return None
-                abm.message = MessageChain([Plain(text_content)])
+                abm.message = [Plain(text_content)]
                 abm.message_str = text_content
             except (json.JSONDecodeError, TypeError):
                 logger.warning(f"無法解析 Bilibili 文本訊息內容: {data.get('content')}")
@@ -528,7 +554,7 @@ class BilibiliAdapter(Platform):
                 image_url = content_data.get("url")
                 if not image_url:
                     return None
-                abm.message = MessageChain([Image(url=image_url)])
+                abm.message = [Image(url=image_url)]
                 abm.message_str = "[圖片]"
             except (json.JSONDecodeError, TypeError):
                 logger.warning(f"無法解析 Bilibili 圖片訊息內容: {data.get('content')}")
