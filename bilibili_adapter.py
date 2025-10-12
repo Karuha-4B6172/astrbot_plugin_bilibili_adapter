@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import random
 from datetime import datetime
 from typing import Optional
@@ -539,7 +540,13 @@ class BilibiliAdapter(Platform):
         # 消息鏈
         if msg_type == 1:  # 文本消息
             try:
-                content_data = json.loads(data.get("content", "{}"))
+                content_raw = data.get("content")
+                if isinstance(content_raw, str):
+                    content_data = json.loads(content_raw or "{}")
+                elif isinstance(content_raw, dict):
+                    content_data = content_raw
+                else:
+                    return None
                 text_content = content_data.get("content", "")
                 if not text_content:
                     return None
@@ -550,15 +557,40 @@ class BilibiliAdapter(Platform):
                 return None
         elif msg_type == 2:  # 圖片消息
             try:
-                content_data = json.loads(data.get("content", "{}"))
+                content_raw = data.get("content")
+                if isinstance(content_raw, str):
+                    content_data = json.loads(content_raw or "{}")
+                elif isinstance(content_raw, dict):
+                    content_data = content_raw
+                else:
+                    return None
                 image_url = content_data.get("url")
                 if not image_url:
                     return None
-                abm.message = [Image(url=image_url)]
+                abm.message = [Image.fromURL(image_url)]
                 abm.message_str = "[圖片]"
             except (json.JSONDecodeError, TypeError):
-                logger.warning(f"無法解析 Bilibili 圖片訊息內容: {data.get('content')}")
-                return None
+                # 回退：content 可能是非標準 JSON 字串，嘗試用正則抓取 url
+                try:
+                    content_raw = data.get("content")
+                    if isinstance(content_raw, str):
+                        m = re.search(r"\"url\"\s*:\s*\"([^\"\\]+)\"", content_raw)
+                        if not m:
+                            m = re.search(r"'url'\s*:\s*'([^'\\]+)'", content_raw)
+                        if m:
+                            url = m.group(1)
+                            abm.message = [Image.fromURL(url)]
+                            abm.message_str = "[圖片]"
+                            # 成功回退則不中斷
+                        else:
+                            logger.warning(f"無法解析 Bilibili 圖片訊息內容: {data.get('content')}")
+                            return None
+                    else:
+                        logger.warning(f"無法解析 Bilibili 圖片訊息內容: {data.get('content')}")
+                        return None
+                except Exception:
+                    logger.warning(f"無法解析 Bilibili 圖片訊息內容: {data.get('content')}")
+                    return None
         else:
             logger.debug(f"忽略不支援的 Bilibili 訊息類型: {msg_type}")
             return None

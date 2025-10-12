@@ -94,7 +94,7 @@ wmic csproduct get uuid
 ## 参考
 
 - [bilibili-SVG](https://github.com/Remix-Design/remixicon?ref=svgrepo.com)【Apache License】
-- [bilibili-API-collect](https://github.com/ccc666666666/bilibili-API-collect)【CC BY-NC 4.0】
+- [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)【CC BY-NC 4.0】
 
 ## 声明
 
