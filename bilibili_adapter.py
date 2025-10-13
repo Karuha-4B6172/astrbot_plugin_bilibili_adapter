@@ -7,7 +7,6 @@ from typing import Optional
 import aiohttp
 
 from astrbot.api import logger
-from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
@@ -63,6 +62,18 @@ def _inject_astrbot_field_metadata():
                 "type": "string",
                 "hint": "必填。需提供浏览器 UA 字符串。",
                 "obvious_hint": True,
+            },
+            
+            # 訊息處理
+            "process_read_messages": {
+                "description": "处理已读消息",
+                "type": "bool",
+                "hint": "默认 False。开启后，会尝试处理新到但已被标记为已读的消息。",
+            },
+            "read_prefetch_window": {
+                "description": "已读回溯窗口",
+                "type": "int",
+                "hint": "默认为 1。开启『处理已读消息』时生效，设定回溯抓取的最近消息条数。",
             },
 
             # 轮询
@@ -164,25 +175,6 @@ def _inject_astrbot_field_metadata():
         except Exception:
             pass
 
-
-def _pre_unregister_platform():
-    """在注册适配器前，预清理可能残留的注册（仅本插件来源），避免热重载冲突。"""
-    try:
-        from astrbot.core.platform.register import platform_cls_map
-        existing = platform_cls_map.get("bilibili")
-        if existing is not None:
-            mod = getattr(existing, "__module__", "")
-            # 仅当旧注册来自本插件时才清理，避免误删他人适配器
-            if isinstance(mod, str) and "astrbot_plugin_bilibili" in mod:
-                del platform_cls_map["bilibili"]
-                logger.debug("预清理：移除本插件残留的 bilibili 注册。")
-    except Exception:
-        # 静默处理，避免因核心结构差异影响加载
-        pass
-
- 
-
-
 @register_platform_adapter(
     "bilibili",
     "Bilibili Adapter",
@@ -196,6 +188,9 @@ def _pre_unregister_platform():
         "bili_jct": "",
         "device_id": "",
         "user_agent": "",
+        # 訊息處理
+        "process_read_messages": False,
+        "read_prefetch_window": 1,
         # 輪詢
         "polling_interval": 5,
         "min_polling_interval": 2,
@@ -246,6 +241,16 @@ class BilibiliAdapter(Platform):
         # 适配器启动时间戳，用于忽略启动前的离线消息（只ACK不响应）
         self._startup_ts: Optional[int] = None
         self._running = False
+        # 可選：處理新到已讀消息
+        self.process_read_messages: bool = bool(
+            platform_config.get("process_read_messages", False)
+        )
+        self.read_prefetch_window: int = int(
+            platform_config.get("read_prefetch_window", 1)
+        )
+        # 每會話的 ack 與已處理水位
+        self._last_ack_seqno_by_talker: dict[int, int] = {}
+        self._last_processed_seqno_by_talker: dict[int, int] = {}
         logger.info("Bilibili Adapter 初始化完成。")
 
     def _validate_config(self, config: dict):
@@ -275,6 +280,7 @@ class BilibiliAdapter(Platform):
             "min_polling_interval": (1, 60),
             "max_polling_interval": (5, 600),
             "max_retry_count": (1, 10),
+            "read_prefetch_window": (1, 10),
             # 網絡配置
             "timeout_total": (5, 300),
             "timeout_connect": (1, 60),
@@ -393,9 +399,24 @@ class BilibiliAdapter(Platform):
                         if session_info.get("talker_id") == 0:
                             continue
 
-                        if session_info.get("unread_count", 0) > 0:
+                        talker_id = session_info.get("talker_id")
+                        unread_count = session_info.get("unread_count", 0)
+                        ack_seqno = session_info.get("ack_seqno", 0)
+                        prev_ack = self._last_ack_seqno_by_talker.get(talker_id)
+
+                        if unread_count > 0:
                             await self._process_unread_session(session_info)
                             has_messages = True
+                        elif self.process_read_messages:
+                            # 僅當 ack 從上次輪詢提升時，視為有新到已讀消息
+                            if prev_ack is not None and ack_seqno > prev_ack:
+                                await self._process_recent_read_session(
+                                    session_info, prev_ack, ack_seqno
+                                )
+                                has_messages = True
+
+                        # 更新該會話的 ack 水位
+                        self._last_ack_seqno_by_talker[talker_id] = ack_seqno
 
                     # 自適應輪詢間隔調整
                     if has_messages:
@@ -512,6 +533,11 @@ class BilibiliAdapter(Platform):
                         talker_id, session_type, max_seqno_in_batch
                     )
 
+                # 更新已處理水位，避免後續回溯時重複
+                prev_proc = self._last_processed_seqno_by_talker.get(talker_id, 0)
+                if max_seqno_in_batch > prev_proc:
+                    self._last_processed_seqno_by_talker[talker_id] = max_seqno_in_batch
+
         except asyncio.CancelledError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -525,6 +551,87 @@ class BilibiliAdapter(Platform):
         except Exception as e:
             logger.critical(
                 f"處理 Session {talker_id} 的訊息時發生非預期錯誤: {e}",
+                exc_info=True,
+            )
+
+    async def _process_recent_read_session(
+        self, session_info: dict, last_ack: int, current_ack: int
+    ):
+        """處理新到但已被標記為已讀的消息（可選）。
+
+        僅在開關開啟且檢測到 ack 變大時觸發；透過小窗口回溯抓取最近消息，
+        再以啟動時間與已處理水位去重，避免對歷史消息重複回覆。
+        """
+        if not self.process_read_messages or self.read_prefetch_window <= 0:
+            return
+
+        talker_id = session_info.get("talker_id")
+        session_type = session_info.get("session_type")
+
+        try:
+            # 回溯窗口：覆蓋 (last_ack, current_ack]，並多抓幾條以防突發聚合
+            begin_seqno = max(0, int(current_ack) - int(self.read_prefetch_window))
+            messages_data = await self.client.get_messages(
+                talker_id, session_type, begin_seqno
+            )
+
+            if messages_data is None:
+                logger.debug(
+                    f"回溯獲取 Session {talker_id} 消息失敗（已讀模式），跳過"
+                )
+                return
+
+            msgs = messages_data.get("messages") or []
+            if not msgs:
+                return
+
+            max_seq_processed = self._last_processed_seqno_by_talker.get(talker_id, 0)
+            for msg_data in msgs:
+                seq = msg_data.get("msg_seqno", 0)
+                if seq <= last_ack:
+                    continue  # 僅處理 (last_ack, current_ack] 範圍
+                if seq <= max_seq_processed:
+                    continue  # 已處理過的跳過
+                if msg_data.get("sender_uid") == self._self_uid:
+                    continue  # 忽略自己發出的
+
+                # 啟動前的舊消息不處理
+                msg_ts = msg_data.get("timestamp", 0)
+                if isinstance(msg_ts, (int, float)) and msg_ts > 10**12:
+                    msg_ts = int(msg_ts // 1000)
+                if (
+                    self._startup_ts is not None
+                    and isinstance(msg_ts, (int, float))
+                    and msg_ts < self._startup_ts
+                ):
+                    continue
+
+                abm = self.convert_message(msg_data, talker_id)
+                if abm:
+                    await self.handle_msg(abm)
+                    if seq > max_seq_processed:
+                        max_seq_processed = seq
+
+            # 更新已處理水位
+            prev_proc = self._last_processed_seqno_by_talker.get(talker_id, 0)
+            if max_seq_processed > prev_proc:
+                self._last_processed_seqno_by_talker[talker_id] = max_seq_processed
+
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error(
+                f"處理 Session {talker_id} 的已讀消息時發生網絡/超時錯誤: {e}",
+                exc_info=True,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.error(
+                f"處理 Session {talker_id} 的已讀消息時發生數據處理錯誤: {e}",
+                exc_info=True,
+            )
+        except Exception as e:
+            logger.critical(
+                f"處理 Session {talker_id} 的已讀消息時發生非預期錯誤: {e}",
                 exc_info=True,
             )
 

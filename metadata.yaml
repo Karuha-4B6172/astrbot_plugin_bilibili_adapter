@@ -1,5 +1,5 @@
 name: Bilibili Adapter
 author: Magstic, Gemini 2.5 Pro, Claude Opus 4, ChatGPT 5
 description: Bilibili 私信适配器，使用 Cookie 认证。
-version: 0.1.0
+version: 0.1.1
 repo: https://github.com/Hina-Chat/astrbot_plugin_bilibili_adapter

@@ -17,8 +17,7 @@
 ## 3. 平台註冊與熱重載策略
 
 - 使用 `@register_platform_adapter("bilibili", "Bilibili Adapter", default_config_tmpl=..., adapter_display_name="Bilibili", logo_path="assets/bilibili.svg")` 註冊。
-- 註冊前的兜底清理：`_pre_unregister_platform()` 僅在舊註冊的 `__module__` 含 `astrbot_plugin_bilibili` 時刪除殘留，避免誤刪他人同名適配器。
-- 卸載時：`main.py::__del__()` 再次清理 `platform_cls_map["bilibili"]`，保障熱重載穩定。
+- 插件初始化時，`main.py` 在導入適配器前嘗試清理既有的 `bilibili` 註冊（僅清理本插件來源），避免熱重載重複註冊。無模組頂層副作用，不使用 `__del__`。
 - 核心 `register.py` 對重名有嚴格保護：若重複註冊將直接 `ValueError`。
 
 ## 4. 配置與表單注入
@@ -28,6 +27,7 @@
   - 輪詢：`polling_interval`, `min_polling_interval`, `max_polling_interval`, `max_retry_count`。
   - 網絡：`timeout_total`, `timeout_connect`, `timeout_sock_read`, `connection_limit`, `connection_limit_per_host`, `dns_cache_ttl`, `keepalive_timeout`。
   - API：`message_batch_size`, `api_build_version`, `api_mobi_app`。
+  - 訊息處理（可選）：`process_read_messages`（默認 False）、`read_prefetch_window`（範圍 1-10，默認 1）。
 - UI 字段元數據注入：`_inject_astrbot_field_metadata()` 謹慎補齊 `CONFIG_METADATA_2` 的 `items` 描述（只在結構匹配時生效）。不匹配時靜默跳過並打印 debug 日誌。
 
 ## 5. 客戶端與端點
@@ -47,14 +47,15 @@
 - 啟動：創建 `BilibiliClient` -> `get_my_info()` 成功後開始輪詢。
 - 拉取：`get_new_sessions(begin_ts)` -> 遍歷 `session_list`（忽略 `talker_id=0` 系統通知）。
 - 處理會話：`_process_unread_session()` -> `get_messages()` -> 依序轉換並提交事件 -> `update_ack()`。
+- 已讀處理（可選）：當 `unread_count == 0` 且檢測到 ACK 提升，且 `process_read_messages=true` 時，觸發 `_process_recent_read_session()`，以 `read_prefetch_window`（1-10）回溯近期消息，結合啟動時間與已處理水位去重。
 - 轉換：`convert_message()` 生成 `AstrBotMessage`：
-  - 文本：`MessageChain([Plain(text)])`。
-  - 圖片：`MessageChain([Image(url=...)])`。
+  - 文本：`[Plain(text)]`。
+  - 圖片：`[Image.fromURL(url)]`。
   - 時間戳兼容（毫秒/秒）；`abm.id = f"{session_talker_id}-{msg_seqno}"`；`abm.session_id = str(session_talker_id)`；`abm.self_id` 取自啟動時獲得的 UID。
 
 ## 7. 發送策略（BilibiliPlatformEvent）
 
-- **文本合併**：遍歷 `MessageChain`，連續的 `Plain` 合併為單條私信，符合用戶期望的 UX。
+- **文本合併**：遍歷消息段列表（兼容 `MessageChain`/`list`），連續的 `Plain` 合併為單條私信，符合用戶期望的 UX。
 - **接收者解析**：優先將 `session_id` 轉為整數；失敗時回退到 `message_obj.sender.user_id`。
 - **圖片處理**：
   - 支援 `path`/`url`/`raw` 三種來源；本地讀檔使用 `asyncio.to_thread()` 避免阻塞。

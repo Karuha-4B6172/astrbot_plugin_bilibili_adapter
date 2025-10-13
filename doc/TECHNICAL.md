@@ -17,7 +17,7 @@
 
 - **初始化 (`__init__`)**: 校驗配置，設置輪詢與網絡參數。
 - **消息輪詢 (`run`)**: 異步拉取新會話與新消息，忽略 `talker_id=0` 的系統通知，支持自適應輪詢間隔與 ACK 更新。
-- **消息轉換 (`convert_message`)**: 轉換為 `AstrBotMessage`，統一 `message` 為 `MessageChain`，時間戳與 ID 兼容處理（`{session_talker_id}-{msg_seqno}`）。
+ - **消息轉換 (`convert_message`)**: 轉換為 `AstrBotMessage`，`message` 為組件列表（如 `[Plain(...), Image(...)]`），時間戳與 ID 兼容處理（`{session_talker_id}-{msg_seqno}`）。圖片使用 `Image.fromURL(url)`。
 - **事件提交 (`handle_msg`)**: 組裝 `BilibiliPlatformEvent` 並提交。
 
 ### `bilibili_client.py` - API 客戶端
@@ -33,6 +33,8 @@
 
 定義了特定於 Bilibili 平台的事件對象 `BilibiliPlatformEvent`，它繼承自 `AstrMessageEvent`。
 
+- **文本合併**：遍歷消息段列表（兼容 `MessageChain`/`list`），連續的 `Plain` 合併為單條私信，符合用戶期望的 UX。
+
 - **消息發送 (`send`)**: 文本支持連續 `Plain` 自動合併為單條私信；圖片支持 `path/url/raw`，先上傳後發送；遇到不支持的組件輸出 `warning`。
 - **接收者解析**: 優先使用 `session_id` 轉整型，失敗回退為 `sender.user_id`。
 - **概要生成**: `get_message_outline()` 兼容 `MessageChain` 與 `list` 兩種形態以提升兼容性。
@@ -44,6 +46,7 @@
 ### 消息處理流程
 
 - **接收**: `Adapter.run` -> `Client.get_new_sessions` -> `Client.get_messages` -> `Adapter.convert_message` -> `Adapter.handle_msg`
+- **已讀模式（可選）**: 當 `unread_count == 0` 且 ACK 提升，且 `process_read_messages = true` 時，觸發 `_process_recent_read_session()`，按 `read_prefetch_window (1-10，默認 1)` 回溯近期消息並去重處理。
 - **發送**: `Skill` -> `Event.send` -> `Client.upload_image`(可選) -> `Client.send_*`
 
 ### 性能優化與健壯性
@@ -67,13 +70,14 @@ pip install -r requirements.txt
 - `SESSDATA`, `bili_jct`（Cookie）
 - `device_id`, `user_agent`（設備標識）
 - （可選）輪詢與網絡參數：`polling_interval`、`timeout_total`、`connection_limit` 等
+- （可選）已讀處理：`process_read_messages`（默認 False）、`read_prefetch_window`（範圍 1-10，默認 1）
 
 ---
 
 ## 5. 運行與熱重載
 
 - 啟用平台配置後，AstrBot 將自動加載適配器。
-- 熱重載：卸載時 `main.py::__del__()` 清理；註冊前 `_pre_unregister_platform()` 僅清理“本插件來源”的殘留，避免誤刪。
+- 熱重載：插件初始化時 `main.py` 會先嘗試移除既有的 `bilibili` 註冊，避免重複註冊；不使用 `__del__` 或模組級副作用。
 
 ---
 
@@ -87,7 +91,7 @@ pip install -r requirements.txt
 ## 7. 故障排查
 
 - **啟動報錯/無法獲取 UID**：檢查 `SESSDATA` 與 `bili_jct` 是否有效；檢查網絡與代理。
-- **熱重載“已註冊過”**：確保單插件運行；查看日誌 `_pre_unregister_platform()` 是否執行。
+- **熱重載“已註冊過”**：確保單插件運行；查看啟動日誌是否打印“預清理：移除 bilibili 既有註冊”。
 - **圖片發送失敗**：檢查圖片來源；觀察是否命中上載緩存；查看 API 返回碼。
 
 ## 8. 授權與風險聲明

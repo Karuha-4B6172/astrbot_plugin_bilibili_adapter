@@ -33,6 +33,8 @@ class BilibiliPlugin(Star):
             pass
 
         try:
+            from .bilibili_adapter import _inject_astrbot_field_metadata
+            _inject_astrbot_field_metadata()
             from .bilibili_adapter import BilibiliAdapter  # noqa
             from .bilibili_event import BilibiliPlatformEvent  # noqa
         except ImportError as e:
