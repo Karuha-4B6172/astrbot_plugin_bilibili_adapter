@@ -17,6 +17,25 @@ from astrbot.api.platform import (
     MessageType,
 )
 
+# Backwards-compatibility shim: some astrbot versions call Platform() without
+# providing `event_queue`. Wrap `Platform.__init__` so it tolerates missing
+# `event_queue` by trying the original call first, and if it fails due to a
+# TypeError, retry by inserting `None` as the `event_queue` positional arg.
+try:
+    _orig_platform_init = Platform.__init__
+
+    def _platform_init_compat(self, *args, **kwargs):
+        try:
+            return _orig_platform_init(self, *args, **kwargs)
+        except TypeError:
+            # Retry with None as the first positional argument (event_queue)
+            return _orig_platform_init(self, None, *args, **kwargs)
+
+    Platform.__init__ = _platform_init_compat
+except Exception:
+    # If anything goes wrong, don't prevent module import; let real errors surface later.
+    pass
+
 from .bilibili_client import BilibiliClient
 from .bilibili_event import BilibiliPlatformEvent
 
@@ -216,9 +235,29 @@ class BilibiliAdapter(Platform):
     """Bilibili Adapter"""
 
     def __init__(
-        self, platform_config: dict, platform_settings: dict, event_queue: asyncio.Queue
+        self,
+        platform_config: dict,
+        platform_settings: dict,
+        event_queue: Optional[asyncio.Queue] = None,
     ):
-        super().__init__(event_queue)
+        # Make `event_queue` optional to be compatible with different
+        # astrbot versions that may instantiate adapters without it.
+        # Try multiple forms of calling the base initializer to be resilient
+        # against variations in `Platform.__init__` signatures across
+        # astrbot versions.
+        try:
+            super().__init__(event_queue)
+        except TypeError:
+            try:
+                # Some versions may expect no args
+                super().__init__()
+            except TypeError:
+                # As a last resort, try passing None explicitly
+                try:
+                    super().__init__(None)
+                except Exception:
+                    # Give up and re-raise the original error to surface it
+                    raise
         logger.info("Bilibili Adapter 正在初始化...")
 
         # 配置驗證
